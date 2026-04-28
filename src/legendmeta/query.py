@@ -61,7 +61,7 @@ def query_runs(
         - select runs for detectors V01234A and V06789B from Th calibration data
           (using Hades data cycle name ``experiment-det-datatype-run-starttime``)::
 
-            "det in ["V01234A", "V06789B"] and datatype=='th_HS2_lat_psa'``
+            "det in ['V01234A', 'V06789B'] and datatype=='th_HS2_lat_psa'"
 
     dataflow_config
         config file of reference production. If not provided, use the environment
@@ -69,7 +69,7 @@ def query_runs(
 
     group_by
         if ``None`` (default) return a flat array with all cycles. If one or more fields
-        are provided, group entries by these fields (using :meth:ak.run_lengths, so group
+        are provided, group entries by these fields (using :meth:`ak.run_lengths`, so group
         consecutive equal values; this is done after sorting, so be careful if sorting
         changes order!) Fields that vary within groups will be un-flattened into 2-D ragged
         arrays. Note that ``runs`` query cannot act collectively on grouped cycles.
@@ -275,7 +275,7 @@ def query_meta(
         - select runs for detectors V01234A and V06789B from Th calibration data
           (using Hades data cycle name ``experiment-det-datatype-run-starttime``)::
 
-            "det in ["V01234A", "V06789B"] and datatype=='th_HS2_lat_psa'``
+            "det in ["V01234A", "V06789B"] and datatype=='th_HS2_lat_psa'"
 
     channels
         expression used to select channels for each run. Expression can
@@ -367,7 +367,7 @@ def query_meta(
         format of returned table. Can be ``ak`` (default), ``pd`` or ``np``
 
     query_run_kwargs
-        see :meth:`query_run`
+        see :meth:`query_runs`
     """
     if isinstance(dataflow_config, (Path, str)):
         df_config = Props.read_from(
@@ -398,6 +398,7 @@ def query_meta(
     if metadata is None:
         if "metadata" not in query_config:
             msg = "metadata must be provided either as kwarg or in dataflow_config"
+            raise ValueError(msg)
         metadata = query_config["metadata"]
     if isinstance(metadata, str):
         meta = getattr(legendmeta, metadata)(df_paths["metadata"])
@@ -408,6 +409,7 @@ def query_meta(
 
     if not isinstance(meta, MetadataRepository):
         msg = "metadata must be a MetadataRepository derived class"
+        raise ValueError(msg)
 
     # if using a string for chan_db, get it set up
     if chan_db is None:
@@ -437,7 +439,7 @@ def query_meta(
             col_name_map[path] = alias
 
         # path can only be aliased to a single name
-        elif path in col_name_map and alias == col_name_map[path]:
+        elif path in col_name_map and alias != col_name_map[path]:
             msg = f"{path} assigned multiple alias names"
             raise ValueError(msg)
 
@@ -491,7 +493,7 @@ def query_meta(
             raise ValueError(msg)
 
         if info.get("channel_entry") and not all(
-            v in run_records.fields or v[:4] == "@chan"
+            v in run_records.fields or v.startswith("@chan")
             for v in _format_vars(info["channel_entry"])
         ):
             msg = f"channel_entry {info['channel_entry']} for {key} references values not found in run DB or channel DB"
@@ -502,7 +504,7 @@ def query_meta(
     # get the paths and groups corresponding to our query
     par_db_config = query_config.get("par_db", {"channel_entry": "{@chan.name}"})
     if "channel_entry" in par_db_config and not all(
-        v in run_records.fields or v[:5] == "@chan"
+        v in run_records.fields or v.startswith("@chan")
         for v in _format_vars(par_db_config["channel_entry"])
     ):
         msg = f"channel_entry {par_db_config['channel_entry']} for par_db references values not found in run DB or channel DB"
@@ -512,15 +514,12 @@ def query_meta(
         if not any(v.split(".")[0] == f"@{key}" for v in col_name_map):
             continue
 
-        if key[:4] != "par_":
+        if not key.startswith("par_"):
             continue
         if tiers is not None and key[4:] not in tiers:
             continue
 
         db = TextDB(path, lazy=True)
-        # if not par_db_config.get("cycle_entry") and not "validity" in db:
-        #    continue
-
         db_list[f"@{key}"] = par_db_config | {"db": db}
 
     # Check that all parameters we try to read have a valid source
@@ -637,7 +636,7 @@ def _query_loop(
     for run_record in run_records:
         if isinstance(run_record, ak.Record):
             run_record = run_record.tolist()  # noqa: PLW2901
-        time = run_record["starttime"]
+        time = run_record.get("starttime")
         while isinstance(time, list):
             time = time[0]
 
@@ -648,6 +647,9 @@ def _query_loop(
         for k, db_info in db_list.items():
             try:
                 if "cycle_entry" not in db_info:
+                    if not time:
+                        msg = f"starttime not found in rundb, cannot access {k} db"
+                        raise ValueError(msg)
                     if cycle_dbs.get(k) is None or not cycle_dbs[k].is_valid(time):
                         cycle_dbs[k] = db_info["db"].on(time)
                 else:
@@ -659,10 +661,13 @@ def _query_loop(
                 cycle_dbs[k] = None
 
         if not chan_db:
+            if not time:
+                msg = "starttime not found in rundb, cannot access channelmap"
+                raise ValueError(msg)
             if chanlist is None or not chanlist.is_valid(time):
                 chanlist = meta.channelmap(on=time)
         else:
-            chanlist = meta[chan_db.config(run_record)]
+            chanlist = meta[chan_db.format(run_record)]
 
         # Get run DB entry corresponding to current run and get @run values
         for path, alias in col_name_map.items():
@@ -714,7 +719,7 @@ def _query_loop(
             # Evaluate the channel expression on the found values
             try:
                 keep_record = bool(eval(channels, {}, ch_record))
-            except Exception:
+            except (TypeError, NameError, KeyError, AttributeError):
                 continue
             eval_success = True
 
@@ -749,21 +754,26 @@ def _format_vars(fstring: str):
     return [v[1] for v in string.Formatter().parse(fstring) if v[1]]
 
 
-def parse_query_paths(expr: str, fullmatch: bool = False) -> tuple[str, str | None, str]:
+def parse_query_paths(
+    expr: str, fullmatch: bool = False
+) -> list[tuple[str, str | None, str]] | tuple[str, str | None, str]:
     """
     Parse input string for variable names of the form::
 
         [alias][@ or :][par.path]
 
-    and return a list of each matching pair, with the first element being the
-    alias and the second element being the path. Aliases and names in paths must
-    be legal python names (i.e. alphanumeric, doesn't start with a digit).
-    If ``@`` is used to separate the alias and path, it is left in the path (to
-    denote a metadata location); if ``:`` is used, it is omitted.
+    and return a list of each matching 3-tuple of the form::
+
+        (full_match, alias, path)
+
+    Aliases and names in paths must be legal python names (i.e. alphanumeric, doesn't
+    start with a digit). If ``@`` is used to separate the alias and path, it is left in
+    the path (to denote a metadata location); if ``:`` is used, it is omitted.
     Note that function names (i.e. a valid name followed by ``(``) are excluded.
     Values inside of ``[...]``, ``{...}``, ``"..."``, and ``'...'`` are also excluded.
 
-    If fullmatch is ``True``, expect full string to match pattern and return single pair.
+    If fullmatch is ``True``, expect full string to match pattern and return single tuple.
+    Otherwise return a list of tuples, for each match found.
     """
     # Note: ast does not like @'s and :'s used in this way, so instead we parse with regex
     if not fullmatch:
