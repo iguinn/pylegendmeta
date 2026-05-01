@@ -650,8 +650,7 @@ def _query_loop(
                     if not time:
                         msg = f"starttime not found in rundb, cannot access {k} db"
                         raise ValueError(msg)
-                    if cycle_dbs.get(k) is None or not cycle_dbs[k].is_valid(time):
-                        cycle_dbs[k] = db_info["db"].on(time)
+                    cycle_dbs[k] = db_info["db"].on(time)
                 else:
                     cycle_dbs[k] = _get_recursive(
                         db_info["db"], db_info["cycle_entry"].format(**run_record)
@@ -664,8 +663,7 @@ def _query_loop(
             if not time:
                 msg = "starttime not found in rundb, cannot access channelmap"
                 raise ValueError(msg)
-            if chanlist is None or not chanlist.is_valid(time):
-                chanlist = meta.channelmap(on=time)
+            chanlist = meta.channelmap(on=time)
         else:
             chanlist = meta[chan_db.format(run_record)]
 
