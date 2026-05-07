@@ -165,9 +165,11 @@ def query_runs(
 
         # Format and return results
         records.sort(
-            key=lambda rec: rec[sort_by]
-            if isinstance(sort_by, str)
-            else [rec[sb] for sb in sort_by]
+            key=lambda rec: (
+                rec[sort_by]
+                if isinstance(sort_by, str)
+                else [rec[sb] for sb in sort_by]
+            )
         )
         result = ak.Array(records)
 
