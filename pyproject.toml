@@ -33,7 +33,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "packaging",
-    "dbetto>=1.2.2",
+    "dbetto>=1.3.5",
     "GitPython",
     "numpy",
     "awkward",
@@ -78,8 +78,11 @@ test = [
 ]
 
 [project.scripts]
+validate-cal-groupings = "legendmeta.police:validate_cal_groupings"
 validate-legend-chmaps = "legendmeta.police:validate_legend_channel_map"
 validate-legend-detdb = "legendmeta.police:validate_legend_detector_db"
+validate-phy-groupings = "legendmeta.police:validate_phy_groupings"
+validate-statuses = "legendmeta.police:validate_statuses"
 validate-validity = "legendmeta.police:validate_validity"
 
 [tool.setuptools]
@@ -102,7 +105,7 @@ namespaces = false
 attr = "legendmeta._version.version"
 
 [tool.codespell]
-ignore-words-list = "crate,nd,unparseable,compiletime"
+ignore-words-list = "crate,nd,unparseable,compiletime,puls"
 
 [tool.pytest.ini_options]
 minversion = "6.0"

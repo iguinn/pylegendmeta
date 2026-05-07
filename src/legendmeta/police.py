@@ -25,6 +25,9 @@ import yaml
 from dbetto import Props, TextDB, utils
 from dbetto.catalog import Catalog
 
+from .legendmetadata import LegendMetadata
+from .utils import _RUN_RANGE_PATTERN, expand_runs
+
 templates = resources.files("legendmeta") / "templates"
 
 
@@ -89,7 +92,7 @@ def validate_legend_channel_map() -> bool:
     args = parser.parse_args()
 
     dict_temp = {}
-    for typ in ("geds", "spms"):
+    for typ in ("geds", "spms", "pmts", "auxs", "bsln", "puls"):
         dict_temp[typ] = utils.load_dict(templates / f"{typ}-channel.yaml")
 
     for d in {Path(f).parent for f in args.files}:
@@ -117,6 +120,8 @@ def validate_legend_channel_map() -> bool:
                         )
                         continue
 
+                    valid *= _check_chmap_key_name(k, v)
+
                     valid *= validate_dict_schema(
                         v,
                         dict_temp[v["system"]],
@@ -127,6 +132,17 @@ def validate_legend_channel_map() -> bool:
 
         if not valid:
             sys.exit(1)
+
+
+def _check_chmap_key_name(key: str, entry: dict, verbose: bool = True) -> bool:
+    """Return True if entry's 'name' field is absent or matches the dict key."""
+    if "name" in entry and entry["name"] != key:
+        if verbose:
+            print(  # noqa: T201
+                f"ERROR: '{key}': key does not match 'name' field '{entry['name']}'"
+            )
+        return False
+    return True
 
 
 def validate_dict_schema(
@@ -244,6 +260,59 @@ def len_nested(d: dict) -> int:
     return count
 
 
+def _find_unreferenced_files(
+    validity_file: str, referenced: set[str], verbose: bool = True
+) -> list[str]:
+    """Find YAML/JSON data files not referenced in the validity file.
+
+    Parameters
+    ----------
+    validity_file
+        Path to the validity YAML file.
+    referenced
+        Set of file paths (relative to the validity file's directory) that
+        are referenced in the validity file's ``apply`` entries.
+    verbose
+        If True, print error messages.
+
+    Returns
+    -------
+    list[str]
+        Relative paths of unreferenced data files.
+    """
+    parent = Path(validity_file).parent
+    unreferenced = []
+
+    for data_file in sorted(parent.rglob("*")):
+        if not data_file.is_file():
+            continue
+        if data_file.suffix not in (".yaml", ".json"):
+            continue
+        if data_file.name == "validity.yaml":
+            continue
+
+        rel = data_file.relative_to(parent)
+
+        # skip files in subdirectories that have their own validity.yaml
+        skip = False
+        for p in rel.parents:
+            if p != Path() and (parent / p / "validity.yaml").exists():
+                skip = True
+                break
+        if skip:
+            continue
+
+        rel_str = str(rel)
+        if rel_str not in referenced:
+            unreferenced.append(rel_str)
+            if verbose:
+                print(  # noqa: T201
+                    f" ERROR : {rel_str} not referenced in {validity_file}"
+                )
+
+    return unreferenced
+
+
 def validate_validity():
     parser = argparse.ArgumentParser(
         prog="validate-validity", description="Validate LEGEND validity files"
@@ -257,13 +326,606 @@ def validate_validity():
         Catalog.read_from(file)
         # check files in validity exist
         valid_dic = Props.read_from(str(file))
+        referenced_files = set()
         for dic in valid_dic:
             for f in dic["apply"]:
+                referenced_files.add(f)
                 full_path = Path(file).parent / f
                 if full_path.exists() is False:
                     print(  # noqa: T201
                         f" ERROR : no file {full_path}"
                     )
                     valid = False
+
+        # check for files not referenced in validity
+        if _find_unreferenced_files(file, referenced_files):
+            valid = False
+
     if not valid:
+        sys.exit(1)
+
+
+_VALID_USABILITY = {"on", "off", "ac"}
+_VALID_PSD_STATUS = {"present", "valid", "missing"}
+_GE_PREFIXES = ("V", "C", "B", "P")
+_SIPM_PREFIXES = ("S",)
+_RUN_PATTERN = re.compile(r"^r\d{3}$")
+
+
+def validate_statuses() -> None:
+    """Validate LEGEND status files.
+
+    Invoked in CLI. Accepts validity files; derives the status directory from each.
+    """
+    parser = argparse.ArgumentParser(
+        prog="validate-statuses", description="Validate LEGEND status files"
+    )
+    parser.add_argument("files", nargs="+", help="validity files")
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="sort status entry keys in place instead of reporting errors",
+    )
+    args = parser.parse_args()
+
+    try:
+        meta = LegendMetadata()
+    except Exception as e:
+        print(f"WARNING: could not initialize LegendMetadata: {e}")  # noqa: T201
+        print("WARNING: channel map cross-checks will be skipped")  # noqa: T201
+        meta = None
+
+    modified = False
+    if args.fix:
+        for validity_file in args.files:
+            modified |= _fix_status_files(validity_file)
+
+    valid = True
+    for validity_file in args.files:
+        d = Path(validity_file).parent
+        db = TextDB(d)
+        valid_dic = Props.read_from(str(validity_file))
+
+        for dic in valid_dic:
+            ts = dic["valid_from"]
+            try:
+                state = db.on(ts)
+            except Exception as e:
+                print(f"ERROR: could not load status at '{ts}': {e}")  # noqa: T201
+                valid = False
+                continue
+
+            chmap = (
+                meta.hardware.configuration.channelmaps.on(ts)
+                if meta is not None
+                else None
+            )
+
+            for ch, entry in state.items():
+                if not isinstance(entry, dict):
+                    continue
+
+                if chmap is not None and ch not in chmap:
+                    print(f"ERROR: '{ch}' at '{ts}': key not found in channel map")  # noqa: T201
+                    valid = False
+
+                is_ge = ch.startswith(_GE_PREFIXES) and not ch.startswith("PMT")
+                is_sipm = ch.startswith(_SIPM_PREFIXES)
+
+                if not is_ge and not is_sipm:
+                    continue
+
+                # usability
+                if "usability" not in entry:
+                    print(f"ERROR: '{ch}' at '{ts}': missing 'usability' field")  # noqa: T201
+                    valid = False
+                elif entry["usability"] not in _VALID_USABILITY:
+                    print(  # noqa: T201
+                        f"ERROR: '{ch}' at '{ts}': usability '{entry['usability']}'"
+                        f" not in {_VALID_USABILITY}"
+                    )
+                    valid = False
+
+                # processable
+                if "processable" not in entry:
+                    print(f"ERROR: '{ch}' at '{ts}': missing 'processable' field")  # noqa: T201
+                    valid = False
+                elif not isinstance(entry["processable"], bool):
+                    print(  # noqa: T201
+                        f"ERROR: '{ch}' at '{ts}': 'processable' must be true or false"
+                    )
+                    valid = False
+
+                if is_ge:
+                    # reason
+                    if "reason" not in entry:
+                        print(f"ERROR: '{ch}' at '{ts}': missing 'reason' field")  # noqa: T201
+                        valid = False
+                    elif entry.get("usability") != "on" and not entry["reason"]:
+                        print(  # noqa: T201
+                            f"ERROR: '{ch}' at '{ts}': 'reason' must be non-empty"
+                            f" when usability is '{entry.get('usability')}'"
+                        )
+                        valid = False
+
+                    # psd/status
+                    if "psd" not in entry:
+                        print(f"ERROR: '{ch}' at '{ts}': missing 'psd' field")  # noqa: T201
+                        valid = False
+                    elif (
+                        not isinstance(entry["psd"], dict)
+                        or "status" not in entry["psd"]
+                    ):
+                        print(f"ERROR: '{ch}' at '{ts}': missing 'psd/status' dict")  # noqa: T201
+                        valid = False
+                    elif not isinstance(entry["psd"]["status"], dict):
+                        print(  # noqa: T201
+                            f"ERROR: '{ch}' at '{ts}': 'psd/status' must be a dict"
+                        )
+                        valid = False
+                    else:
+                        for k, v in entry["psd"]["status"].items():
+                            if v not in _VALID_PSD_STATUS:
+                                print(  # noqa: T201
+                                    f"ERROR: '{ch}' at '{ts}': psd/status/{k}"
+                                    f" value '{v}' not in {_VALID_PSD_STATUS}"
+                                )
+                                valid = False
+
+    if modified or not valid:
+        sys.exit(1)
+
+
+_STATUS_KEY_ORDER = ("reason", "usability", "processable", "is_blinded", "psd")
+_PSD_KEY_ORDER = ("is_bb_like", "status")
+
+
+def _sort_status_entry(entry: dict) -> dict:
+    """Return a copy of a channel status entry with keys in canonical order."""
+    result = {}
+    for key in _STATUS_KEY_ORDER:
+        if key not in entry:
+            continue
+        if key == "psd" and isinstance(entry[key], dict):
+            psd = entry[key]
+            sorted_psd = {k: psd[k] for k in _PSD_KEY_ORDER if k in psd}
+            sorted_psd.update({k: v for k, v in psd.items() if k not in sorted_psd})
+            result[key] = sorted_psd
+        else:
+            result[key] = entry[key]
+    result.update({k: v for k, v in entry.items() if k not in result})
+    return result
+
+
+def _needs_reorder(a: dict, b: dict) -> bool:
+    """Return True if key order differs (recursively) between a and b."""
+    if list(a.keys()) != list(b.keys()):
+        return True
+    for k, v in a.items():
+        if (
+            isinstance(v, dict)
+            and isinstance(b.get(k), dict)
+            and _needs_reorder(v, b[k])
+        ):
+            return True
+    return False
+
+
+def _sort_groupings_groups(groups: dict) -> dict:
+    """Return a copy of a groups dict with groups and periods/runs sorted."""
+    result = {}
+    for group in sorted(groups):
+        periods = groups[group]
+        if not isinstance(periods, dict):
+            result[group] = periods
+            continue
+        sorted_periods = {}
+        for period in sorted(str(p) for p in periods):
+            runs = periods[period]
+            sorted_periods[period] = (
+                sorted(runs, key=_run_sort_key) if isinstance(runs, list) else runs
+            )
+        result[group] = sorted_periods
+    return result
+
+
+def _sort_groupings_data(data: dict) -> dict:
+    """Return a copy of groupings data with all keys sorted, default first."""
+    result = {}
+    if "default" in data:
+        val = data["default"]
+        result["default"] = (
+            _sort_groupings_groups(val) if isinstance(val, dict) else val
+        )
+    for key in sorted(k for k in data if k != "default"):
+        val = data[key]
+        result[key] = _sort_groupings_groups(val) if isinstance(val, dict) else val
+    return result
+
+
+def _fix_groupings_file(file: str) -> bool:
+    """Sort a groupings file in place. Returns True if the file was modified."""
+    data = utils.load_dict(file)
+    sorted_data = _sort_groupings_data(data)
+    if not (_needs_reorder(data, sorted_data) or data != sorted_data):
+        return False
+    with Path(file).open("w") as f:
+        yaml.dump(
+            sorted_data,
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+        )
+    print(f"Fixed: sorted keys in '{file}'")  # noqa: T201
+    return True
+
+
+def _fix_status_files(validity_file: str) -> bool:
+    """Sort channel entry keys in all status YAML files beside the validity file.
+
+    Returns True if any file was modified.
+    """
+    d = Path(validity_file).parent
+    modified = False
+    for yaml_file in sorted(d.glob("*.yaml")):
+        if yaml_file.name == "validity.yaml":
+            continue
+        data = utils.load_dict(str(yaml_file))
+        if not isinstance(data, dict):
+            continue
+        sorted_data = {}
+        changed = False
+        for ch, entry in data.items():
+            if isinstance(entry, dict):
+                sorted_entry = _sort_status_entry(entry)
+                sorted_data[ch] = sorted_entry
+                if _needs_reorder(entry, sorted_entry):
+                    changed = True
+            else:
+                sorted_data[ch] = entry
+        if changed:
+            with yaml_file.open("w") as f:
+                yaml.dump(
+                    sorted_data,
+                    f,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+            print(f"Fixed: sorted keys in '{yaml_file}'")  # noqa: T201
+            modified = True
+    return modified
+
+
+def _run_sort_key(spec: str) -> str:
+    """Sort key for a run spec (individual or range): the starting run string."""
+    return spec.split("..", maxsplit=1)[0]
+
+
+def _validate_run_spec(runs: object, location: str, verbose: bool = True) -> bool:
+    """Validate a run specification: string range or list of runs/ranges."""
+    if isinstance(runs, str):
+        if not _RUN_RANGE_PATTERN.match(runs):
+            if verbose:
+                print(  # noqa: T201
+                    f"ERROR: '{location}': runs '{runs}' must be a range of the form r###..r###"
+                )
+            return False
+        return True
+
+    if isinstance(runs, list):
+        valid = True
+        for item in runs:
+            s = str(item)
+            if not (_RUN_PATTERN.match(s) or _RUN_RANGE_PATTERN.match(s)):
+                if verbose:
+                    print(  # noqa: T201
+                        f"ERROR: '{location}': run item '{item}'"
+                        " must be r### or r###..r###"
+                    )
+                valid = False
+        return valid
+
+    if verbose:
+        print(f"ERROR: '{location}': runs must be a string or list, got {type(runs)}")  # noqa: T201
+    return False
+
+
+def _get_overridden_runs(
+    run_override_entries: list, runinfo: dict
+) -> set[tuple[str, str]]:
+    """Return (period, run) pairs whose cal falls inside a run_override window.
+
+    The run_override file defines windows of time during which certain
+    replacement cal files are applied (non-empty ``apply`` list).  Any run
+    whose ``cal.start_key`` falls within such a window (i.e. the timestamp is
+    ≥ the window start and < the next reset timestamp) is considered overridden.
+    A single window can cover multiple calibrations.
+
+    Parameters
+    ----------
+    run_override_entries
+        Parsed list of run_override entries (each a dict with 'valid_from' and 'apply').
+    runinfo
+        Parsed runinfo dict mapping period → run → info (with cal.start_key).
+    """
+    # Sort entries chronologically (timestamps are ISO strings that sort lexicographically)
+    sorted_entries = sorted(run_override_entries, key=lambda e: str(e["valid_from"]))
+
+    # Build (window_start, window_end) pairs where apply is non-empty.
+    # window_end is the valid_from of the next entry (the reset); None means open-ended.
+    windows: list[tuple[str, str | None]] = []
+    for i, entry in enumerate(sorted_entries):
+        if entry.get("apply"):
+            start = str(entry["valid_from"])
+            end = (
+                str(sorted_entries[i + 1]["valid_from"])
+                if i + 1 < len(sorted_entries)
+                else None
+            )
+            windows.append((start, end))
+
+    overridden: set[tuple[str, str]] = set()
+    for period, runs in runinfo.items():
+        for run, info in runs.items():
+            if "cal" not in info:
+                continue
+            cal_ts = str(info["cal"]["start_key"])
+            for start, end in windows:
+                in_window = cal_ts >= start and (end is None or cal_ts < end)
+                if in_window:
+                    overridden.add((period, run))
+                    break
+
+    return overridden
+
+
+def _check_cal_override_runs(
+    file: str,
+    overridden_runs: set[tuple[str, str]],
+    verbose: bool = True,
+) -> bool:
+    """Check that no overridden run appears in a cal_groupings file.
+
+    Parameters
+    ----------
+    file
+        Path to the cal_groupings YAML file.
+    overridden_runs
+        Set of (period, run) pairs that must not appear in the file.
+    verbose
+        If False, suppress error output.
+    """
+    data = utils.load_dict(file)
+    valid = True
+    for name, groups in data.items():
+        if not isinstance(groups, dict):
+            continue
+        for group, periods in groups.items():
+            if not isinstance(periods, dict):
+                continue
+            for period, runs in periods.items():
+                period_str = str(period)
+                for run in expand_runs(runs):
+                    if (period_str, run) in overridden_runs:
+                        if verbose:
+                            print(  # noqa: T201
+                                f"ERROR: '{file}': '{name}/{group}/{period}/{run}'"
+                                " is overridden in run_override and must not"
+                                f" appear in '{file}'"
+                            )
+                        valid = False
+    return valid
+
+
+def _validate_groupings_file(
+    file: str,
+    group_prefix: str,
+    verbose: bool = True,
+) -> bool:
+    """Shared validation logic for cal/phy groupings files.
+
+    Parameters
+    ----------
+    file
+        Path to the groupings YAML file.
+    group_prefix
+        Expected prefix for group names (e.g. 'calgroup' or 'phygroup').
+    verbose
+        If False, suppress error output.
+    """
+    group_re = re.compile(rf"^{re.escape(group_prefix)}\d{{3}}[a-z]$")
+    period_re = re.compile(r"^p\d{2}$")
+
+    data = utils.load_dict(file)
+
+    if "default" not in data:
+        if verbose:
+            print(f"ERROR: '{file}': missing 'default' key")  # noqa: T201
+        return False
+
+    default = data["default"]
+    valid = True
+
+    # --- sort checks on top-level keys ---
+    top_keys = list(data.keys())
+    if top_keys[0] != "default":
+        if verbose:
+            print(  # noqa: T201
+                f"ERROR: '{file}': 'default' must be the first key"
+                f" (found '{top_keys[0]}')"
+            )
+        valid = False
+    non_default_keys = top_keys[1:]
+    if non_default_keys != sorted(non_default_keys):
+        if verbose:
+            print(  # noqa: T201
+                f"ERROR: '{file}': top-level keys after 'default' must be"
+                " lexicographically sorted"
+            )
+        valid = False
+
+    for name, groups in data.items():
+        if not isinstance(groups, dict):
+            if verbose:
+                print(f"ERROR: '{file}': top-level entry '{name}' is not a dict")  # noqa: T201
+            valid = False
+            continue
+
+        # --- sort check on group names within each entry ---
+        group_keys = list(groups.keys())
+        if group_keys != sorted(group_keys):
+            if verbose:
+                print(  # noqa: T201
+                    f"ERROR: '{file}': '{name}' group names must be"
+                    " lexicographically sorted"
+                )
+            valid = False
+
+        for group, periods in groups.items():
+            # enforce group naming convention
+            if not group_re.match(group):
+                if verbose:
+                    print(  # noqa: T201
+                        f"ERROR: '{file}': '{name}/{group}'"
+                        f" group name must match '{group_prefix}NNNx'"
+                        f" (e.g. {group_prefix}001a)"
+                    )
+                valid = False
+
+            if not isinstance(periods, dict):
+                if verbose:
+                    print(  # noqa: T201
+                        f"ERROR: '{file}': '{name}/{group}' must be a dict of periods"
+                    )
+                valid = False
+                continue
+
+            # --- sort check on period names ---
+            period_keys = [str(p) for p in periods]
+            if period_keys != sorted(period_keys):
+                if verbose:
+                    print(  # noqa: T201
+                        f"ERROR: '{file}': '{name}/{group}' period names must be"
+                        " lexicographically sorted"
+                    )
+                valid = False
+
+            for period, runs in periods.items():
+                period_str = str(period)
+
+                # enforce period naming convention
+                if not period_re.match(period_str):
+                    if verbose:
+                        print(  # noqa: T201
+                            f"ERROR: '{file}': '{name}/{group}/{period}'"
+                            " period must match 'pNN' (e.g. p03)"
+                        )
+                    valid = False
+
+                # validate run specification format
+                valid &= _validate_run_spec(
+                    runs, f"{file}/{name}/{group}/{period}", verbose=verbose
+                )
+
+                # sort check on list-type runs
+                if isinstance(runs, list):
+                    run_strs = [str(r) for r in runs]
+                    if run_strs != sorted(run_strs, key=_run_sort_key):
+                        if verbose:
+                            print(  # noqa: T201
+                                f"ERROR: '{file}': '{name}/{group}/{period}'"
+                                " run list must be sorted"
+                            )
+                        valid = False
+
+            # for non-default entries, the group dict must not exactly
+            # replicate the corresponding default entry (redundant override)
+            if name != "default" and group in default and periods == default[group]:
+                if verbose:
+                    print(  # noqa: T201
+                        f"ERROR: '{file}': '{name}/{group}'"
+                        " exactly matches the default entry — redundant override"
+                    )
+                valid = False
+
+    return valid
+
+
+def validate_cal_groupings() -> None:
+    """Validate LEGEND calibration groupings files.
+
+    Invoked in CLI. Expects run_override.yaml and runinfo.yaml to be in the
+    same directory as each groupings file.
+    """
+    parser = argparse.ArgumentParser(
+        prog="validate-cal-groupings",
+        description="Validate LEGEND calibration groupings files",
+    )
+    parser.add_argument("files", nargs="+", help="cal_groupings files")
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="sort groupings files in place instead of reporting errors",
+    )
+    args = parser.parse_args()
+
+    modified = False
+    valid = True
+    for file in args.files:
+        if args.fix:
+            modified |= _fix_groupings_file(file)
+
+        d = Path(file).parent
+        run_override_path = d / "run_override.yaml"
+        runinfo_path = d / "runinfo.yaml"
+
+        overridden: set[tuple[str, str]] = set()
+        if run_override_path.exists() and runinfo_path.exists():
+            with run_override_path.open() as f:
+                run_override_entries = yaml.safe_load(f) or []
+            runinfo = utils.load_dict(str(runinfo_path))
+            overridden = _get_overridden_runs(run_override_entries, runinfo)
+        else:
+            if not run_override_path.exists():
+                print(  # noqa: T201
+                    f"WARNING: '{run_override_path}' not found, skipping override check"
+                )
+            if not runinfo_path.exists():
+                print(f"WARNING: '{runinfo_path}' not found, skipping override check")  # noqa: T201
+
+        valid &= _validate_groupings_file(file, "calgroup")
+        if overridden:
+            valid &= _check_cal_override_runs(file, overridden)
+
+    if modified or not valid:
+        sys.exit(1)
+
+
+def validate_phy_groupings() -> None:
+    """Validate LEGEND physics groupings files.
+
+    Invoked in CLI.
+    """
+    parser = argparse.ArgumentParser(
+        prog="validate-phy-groupings",
+        description="Validate LEGEND physics groupings files",
+    )
+    parser.add_argument("files", nargs="+", help="phy_groupings files")
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="sort groupings files in place instead of reporting errors",
+    )
+    args = parser.parse_args()
+
+    modified = False
+    valid = True
+    for file in args.files:
+        if args.fix:
+            modified |= _fix_groupings_file(file)
+        valid &= _validate_groupings_file(file, "phygroup")
+
+    if modified or not valid:
         sys.exit(1)
