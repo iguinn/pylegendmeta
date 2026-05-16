@@ -33,7 +33,7 @@ def query_runs(
     sort_by: str | Collection[str] = "cycle",
     library: str = "ak",
     cycle_def: str | None = None,
-    rundb_tier: str | None = None,
+    tiers: str | Collection[str] | Mapping[str, str] | None = None,
     ignored_cycles: str | Collection[str] | None = None,
 ):
     """
@@ -88,9 +88,14 @@ def query_runs(
         - ``experiment-period-run-datatype-cycle`` for a L200 cycle, e.g. ``l200-p03-r001-cal-19720101T000000Z``
         - ``experiment-chan-datatype-run-starttime`` for a Hades cycle, e.g. ``char_data-V05268A-th_HS2_lat_psa-r001-20201008T122118Z``
 
-    rundb_tier
-        name of tier (e.g. ``raw``) used to walk through directories to populate run DB.
-        By default get from dataflow-config, or set to ``raw``
+    tiers
+        tiers used to find files. First tier in list is used to walk through
+        directories to populate run DB. Remaining tiers are checked for presence of
+        cycles; a cycle is only added if it exists for each tier. File relative path
+        for each tier's file is added as a column called ``tier_[t]``. Can provide:
+        - Mapping from tier name to path to root of tier
+        - List of tier names/single tier name. Paths will be found in ``dataflow_config["paths"]``
+        - ``None``: read from ``dataflow_config``; if ``tiers`` entry not found, use ``"raw"``
 
     ignored_cycles
         path(s) in metadata to list(s) of ignored cycles. By default get from dataflow-config,
@@ -114,8 +119,15 @@ def query_runs(
             raise ValueError(msg)
         cycle_def = query_config["cycle_def"]
 
-    if rundb_tier is None:
-        rundb_tier = query_config.get("rundb_tier", "raw")
+    # turn tiers into list of tier-name/path pairs
+    if tiers is None:
+        tiers = query_config.get("tiers", ["raw"])
+    if isinstance(tiers, str):
+        tiers = [tiers]
+    if isinstance(tiers, Mapping):
+        tiers = [(f"tier_{t}", p) for t, p in tiers.items()]
+    else:
+        tiers = [(f"tier_{t}", df_paths[f"tier_{t}"]) for t in tiers]
 
     if ignored_cycles is None:
         ignored_cycles = query_config.get("ignored_cycles", None)
@@ -123,7 +135,7 @@ def query_runs(
     cwd = Path.cwd()
 
     try:
-        os.chdir(df_paths[f"tier_{rundb_tier}"])
+        os.chdir(tiers[0][1])
 
         # Get list of removed cycles if it exists
         if ignored_cycles is not None:
@@ -137,15 +149,24 @@ def query_runs(
             removed = {}
 
         # parser to identify data files
-        parse_cycle = re.compile(f"(.*)-tier_{rundb_tier}\\.lh5")
+        parse_cycle = re.compile(f"(.*)-{tiers[0][0]}\\.lh5")
         col_names = cycle_def.split("-")
         records = []
 
-        for relpath, _, files in os.walk("."):
+        for dirpath, dirnames, files in os.walk("."):
+            relpath = dirpath[2:]  # get rid of ./
+
+            # Prune subdirectories that are not in all tiers
+            for subdir in copy(dirnames):
+                if not all(
+                    Path(cwd, p, relpath, subdir).is_dir() for _, p in tiers[1:]
+                ):
+                    dirnames.remove(subdir)
+
             # parse file names for data
             for f in sorted(files):
                 record = dict.fromkeys(col_names)
-                record["relpath"] = relpath[2:]  # get rid of ./
+                record["relpath"] = relpath
 
                 match = parse_cycle.search(f)
                 if not match:
@@ -154,14 +175,33 @@ def query_runs(
                 if cycle_name in removed:
                     continue
 
+                # extract fields from cycle name
                 cycle = cycle_name
-                for k, v in zip(col_names, cycle_name.split("-"), strict=True):
+                cycle_vals = cycle_name.split("-")
+                if len(cycle_vals) != len(col_names):
+                    continue
+
+                for k, v in zip(col_names, cycle_vals, strict=True):
                     record[k] = v
                 record["cycle"] = cycle
+                record[tiers[0][0]] = f"{tiers[0][1]}/{relpath}/{f}"
 
+                # evaluate the selection
                 select_run = eval(runs, {}, record) if runs else True
-                if bool(select_run):
-                    records.append(record)
+                if not bool(select_run):
+                    continue
+
+                # check if file exists in all tiers and add other tiers' files
+                for t, p in tiers:
+                    path = f"{p}/{relpath}/{cycle}-{t}.lh5"
+                    if not Path(cwd, path).exists():
+                        record = None
+                        break
+                    record[t] = path
+                if not record:
+                    continue
+
+                records.append(record)
 
         # Format and return results
         records.sort(
@@ -388,6 +428,7 @@ def query_meta(
         run_records = query_runs(
             runs,
             dataflow_config=df_config,
+            fields=fields,
             **query_run_kwargs,
         )
     else:
