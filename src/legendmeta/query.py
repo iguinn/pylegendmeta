@@ -31,10 +31,12 @@ def query_runs(
     dataflow_config: Path | str | Mapping = "$REFPROD/dataflow-config.yaml",
     group_by: str | Collection[str] | None = None,
     sort_by: str | Collection[str] = "cycle",
-    library: str = "ak",
     cycle_def: str | None = None,
     tiers: str | Collection[str] | Mapping[str, str] | None = None,
     ignored_cycles: str | Collection[str] | None = None,
+    processes: int | None = None,
+    executor: Executor | None = None,
+    library: str = "ak",
 ):
     """
     Query runs and return a table containing one entry for each cycle and data
@@ -77,9 +79,6 @@ def query_runs(
     sort_by
         field by which to sort table, or list of fields in order by priority
 
-    library
-        format of returned table. Can be ``ak`` (default), ``pd`` or ``np``
-
     cycle_def
         hyphen-separated names of fields in cycle names; names will be used for columns.
         By default get from dataflow-config.
@@ -100,6 +99,18 @@ def query_runs(
     ignored_cycles
         path(s) in metadata to list(s) of ignored cycles. By default get from dataflow-config,
         or else do not skip any cycles.
+
+    processes:
+        number of processes. If ``None``, use number equal to threads available
+        to ``executor`` (if provided), or else do not parallelize
+
+    executor:
+        :class:`concurrent.futures.Executor` object for managing parallelism.
+        If ``None``, create a :class:`concurrent.futures.`ProcessPoolExecutor`
+        with number of processes equal to ``processes``.
+
+    library
+        format of returned table. Can be ``ak`` (default), ``pd`` or ``np``
     """
     if isinstance(dataflow_config, (Path, str)):
         df_config = Props.read_from(
@@ -148,62 +159,45 @@ def query_runs(
         else:
             removed = {}
 
-        # parser to identify data files
-        parse_cycle = re.compile(f"(.*)-{tiers[0][0]}\\.lh5")
         col_names = cycle_def.split("-")
         records = []
+
+        if executor is None and processes:
+            executor = ProcessPoolExecutor(processes)
 
         for dirpath, dirnames, files in os.walk("."):
             relpath = dirpath[2:]  # get rid of ./
 
             # Prune subdirectories that are not in all tiers
             for subdir in copy(dirnames):
-                if not all(
-                    Path(cwd, p, relpath, subdir).is_dir() for _, p in tiers[1:]
-                ):
+                if not all(Path(p, relpath, subdir).is_dir() for _, p in tiers[1:]):
                     dirnames.remove(subdir)
 
-            # parse file names for data
-            for f in sorted(files):
-                record = dict.fromkeys(col_names)
-                record["relpath"] = relpath
-
-                match = parse_cycle.search(f)
-                if not match:
-                    continue
-                cycle_name = match.group(1)
-                if cycle_name in removed:
-                    continue
-
-                # extract fields from cycle name
-                cycle = cycle_name
-                cycle_vals = cycle_name.split("-")
-                if len(cycle_vals) != len(col_names):
-                    continue
-
-                for k, v in zip(col_names, cycle_vals, strict=True):
-                    record[k] = v
-                record["cycle"] = cycle
-                record[tiers[0][0]] = f"{tiers[0][1]}/{relpath}/{f}"
-
-                # evaluate the selection
-                select_run = eval(runs, {}, record) if runs else True
-                if not bool(select_run):
-                    continue
-
-                # check if file exists in all tiers and add other tiers' files
-                for t, p in tiers:
-                    path = f"{p}/{relpath}/{cycle}-{t}.lh5"
-                    if not Path(cwd, path).exists():
-                        record = None
-                        break
-                    record[t] = path
-                if not record:
-                    continue
-
-                records.append(record)
+            if executor is None:
+                records += _get_run_records_loop(
+                    files,
+                    relpath,
+                    col_names,
+                    tiers,
+                    removed,
+                    runs,
+                )
+            else:
+                records.append(
+                    executor.submit(
+                        _get_run_records_loop,
+                        files,
+                        relpath,
+                        col_names,
+                        tiers,
+                        removed,
+                        runs,
+                    )
+                )
 
         # Format and return results
+        if executor is not None:
+            records = [r for recs in records for r in recs.result()]
         records.sort(
             key=lambda rec: (
                 rec[sort_by]
@@ -240,6 +234,62 @@ def query_runs(
 
     finally:
         os.chdir(cwd)
+
+
+def _get_run_records_loop(
+    files: list[str],
+    relpath: str,
+    col_names: list[str],
+    tiers: list[tuple[str, str]],
+    removed: set[str],
+    runs,
+):
+    # Worker for query_runs to build a list of records for a directory
+    records = []
+    # parser to identify data files
+    parse_cycle = re.compile(f"(.*)-{tiers[0][0]}\\.lh5")
+
+    # parse file names for data
+    for f in sorted(files):
+        record = dict.fromkeys(col_names)
+        record["relpath"] = relpath
+
+        match = parse_cycle.search(f)
+        if not match:
+            continue
+        cycle_name = match.group(1)
+        if cycle_name in removed:
+            continue
+
+        # extract fields from cycle name
+        cycle = cycle_name
+        cycle_vals = cycle_name.split("-")
+        if len(cycle_vals) != len(col_names):
+            continue
+
+        for k, v in zip(col_names, cycle_vals, strict=True):
+            record[k] = v
+        record["cycle"] = cycle
+        record[tiers[0][0]] = f"{tiers[0][1]}/{relpath}/{f}"
+
+        # evaluate the selection
+        select_run = eval(runs, {}, record) if runs else True
+        if not bool(select_run):
+            continue
+
+        # check if file exists in all tiers and add other tiers' files
+        for t, p in tiers:
+            path = f"{p}/{relpath}/{cycle}-{t}.lh5"
+            if not Path(path).exists():
+                record = None
+                break
+            record[t] = path
+        if not record:
+            continue
+
+        records.append(record)
+
+    return records
 
 
 def query_meta(
@@ -429,6 +479,8 @@ def query_meta(
             runs,
             dataflow_config=df_config,
             fields=fields,
+            processes=processes,
+            executor=executor,
             **query_run_kwargs,
         )
     else:
